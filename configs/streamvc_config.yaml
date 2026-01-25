@@ -1,0 +1,97 @@
+# StreamVC Training Configuration
+
+model:
+  content_encoder:
+    in_channels: 1  # Mono audio
+    hidden_dim: 64  # D parameter from paper
+    num_layers: 8
+    kernel_size: 5
+    num_classes: 100  # HuBERT k-means clusters
+    dropout: 0.1
+    
+  speaker_encoder:
+    in_channels: 80  # Mel spectrogram features
+    hidden_dim: 256
+    num_layers: 4
+    embedding_dim: 256  # Global speaker embedding
+    pooling_type: "attention"  # Learnable attention pooling
+    
+  decoder:
+    in_channels: 64  # From content encoder
+    hidden_dim: 40  # C parameter from paper
+    num_layers: 12
+    kernel_size: 5
+    output_channels: 1
+    film_conditioning: true
+    lookahead_frames: 2  # 60ms architectural latency
+    
+  f0_extractor:
+    method: "yin"  # Yin algorithm
+    frame_length: 20  # ms
+    f0_min: 50
+    f0_max: 600
+    whitening: true  # Per-utterance mean/std normalization
+    uncertainty_features: 9  # f0 + uncertainty scheme
+
+audio:
+  sample_rate: 16000
+  frame_size: 320  # 20ms at 16kHz
+  hop_length: 320
+  n_fft: 1024
+  n_mels: 80
+  latent_rate: 50  # Hz (20ms frames)
+
+training:
+  batch_size: 16 # Reduced for longer 2-second segments
+  num_epochs: 100
+  learning_rate: 1.0e-4
+  optimizer: "adamw"
+  weight_decay: 1.0e-6
+  scheduler:
+    type: "cosine"
+    warmup_steps: 1000
+    
+  losses:
+    reconstruction_weight: 1.0
+    content_prediction_weight: 1.0
+    adversarial_weight: 1.0
+    feature_matching_weight: 10.0
+    stft_weight: 45.0
+    
+  discriminator:
+    type: "multi_scale"
+    scales: [1, 2, 4]
+    hidden_dim: 64
+    num_layers: 4
+    
+  gradient:
+    clip_norm: 1.0
+    stop_grad_decoder_to_content: true  # Important!
+
+data:
+  train_datasets:
+    - data/libritts/LibriTTS/train-clean-100
+  val_split: 0.05
+  num_workers: 6
+  pin_memory: true
+  
+  augmentation:
+    pitch_shift: [-2, 2]  # Semitones
+    time_stretch: [0.9, 1.1]
+    add_noise: 0.005
+
+checkpointing:
+  save_dir: "./checkpoints/streamvc"
+  save_interval: 5000  # steps
+  keep_last_n: 5
+
+logging:
+  log_dir: "./logs/streamvc"
+  log_interval: 100  # steps
+  use_tensorboard: true
+  use_wandb: false  # Set to true if using W&B
+
+hubert:
+  model_name: "facebook/hubert-base-ls960"
+  layer: 7  # Extract from layer 7
+  kmeans_path: "./data/hubert_centroids_100.pkl"
