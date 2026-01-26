@@ -34,8 +34,9 @@ ENV/
 *~
 
 # Data and models
-data/
+data/*
 !data/.gitkeep
+!data/*.py
 checkpoints/
 !checkpoints/.gitkeep
 outputs/
@@ -86,6 +87,3 @@ local_config.yaml
 *.mp3
 *.flac
 !examples/*.wav
-
-#local envs 
-data/
