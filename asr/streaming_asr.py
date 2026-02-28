@@ -108,7 +108,7 @@ class StreamingASR:
                 return_tensors="pt"
             ).input_features.to(self.device)
             
-            if self.device == "cuda" and self.compute_type == "float16":
+            if str(self.device).startswith("cuda") and self.compute_type == "float16":
                 input_features = input_features.half()
             
             forced_decoder_ids = self.processor.get_decoder_prompt_ids(language=language, task="transcribe")

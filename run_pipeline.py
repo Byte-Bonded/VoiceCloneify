@@ -6,8 +6,8 @@ Streaming end-to-end voice cloning with translation.
 import sys
 from pathlib import Path
 
-# Add parent directory to path
-sys.path.append(str(Path(__file__).parent.parent))
+# Ensure repo root is on sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import torch
 import numpy as np

@@ -3,6 +3,8 @@ Text-to-Speech module using SpeechT5.
 Generates speech from text with speaker embeddings.
 """
 
+from pathlib import Path
+
 import torch
 import numpy as np
 from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, SpeechT5HifiGan
@@ -50,10 +52,23 @@ class TextToSpeech:
         embeddings_dataset = load_dataset(speaker_embeddings_dataset, split="validation")
         
         self.speaker_embeddings = {}
-        for item in embeddings_dataset:
-            self.speaker_embeddings[item['speaker']] = torch.tensor(
+        for idx, item in enumerate(embeddings_dataset):
+            # Dataset may have 'speaker' or 'filename' column — handle both
+            if 'speaker' in item:
+                speaker_id = item['speaker']
+            elif 'filename' in item:
+                speaker_id = Path(item['filename']).stem
+            else:
+                speaker_id = str(idx)
+            self.speaker_embeddings[speaker_id] = torch.tensor(
                 item['xvector']
             ).unsqueeze(0).to(self.device)
+        
+        # If default_speaker not found, fall back to first available speaker
+        if default_speaker not in self.speaker_embeddings:
+            fallback = list(self.speaker_embeddings.keys())[0]
+            print(f"  WARN: Speaker '{default_speaker}' not found, using '{fallback}'")
+            default_speaker = fallback
         
         self.default_speaker = default_speaker
         self.sample_rate = 16000

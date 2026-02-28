@@ -103,10 +103,10 @@ class VoiceConversionDataset(Dataset):
         source_audio = self.random_crop(source_audio)
         source_audio = self.augment_audio(source_audio)
         
-        # Select random target audio (different speaker)
-        # For simplicity, we randomly select another file
-        # In practice, you might want to ensure different speakers
-        target_idx = random.randint(0, len(self.audio_files) - 1)
+        # Select random target audio (ensure different file)
+        target_idx = idx
+        while target_idx == idx and len(self.audio_files) > 1:
+            target_idx = random.randint(0, len(self.audio_files) - 1)
         target_path = self.audio_files[target_idx]
         target_audio = self.load_audio(target_path)
         target_audio = self.random_crop(target_audio)

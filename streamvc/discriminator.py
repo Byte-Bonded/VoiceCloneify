@@ -31,7 +31,7 @@ class DiscriminatorBlock(nn.Module):
             padding=padding,
             groups=groups
         )
-        self.norm = nn.GroupNorm(min(32, out_channels // 4), out_channels)
+        self.norm = nn.GroupNorm(min(32, max(1, out_channels // 4)), out_channels)
         
     def forward(self, x):
         x = self.conv(x)
@@ -178,7 +178,8 @@ def generator_adversarial_loss(
     loss = 0.0
     
     for df in disc_fake_outputs:
-        loss += torch.mean((1.0 - df) ** 2)  # MSE with target=1
+        # Hinge generator loss (consistent with hinge discriminator loss)
+        loss += -torch.mean(df)
     
     return loss / len(disc_fake_outputs)
 
