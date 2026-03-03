@@ -345,11 +345,14 @@ def generate_libritts_testset(data_dir: str, num_samples: int = 50,
         transcript = tf.read_text().strip()
         if not transcript:
             continue
-        # Derive audio path: same stem but .wav
-        wav_path = tf.with_suffix('.wav')
+        # Derive audio path: strip the double suffix (.normalized.txt → .wav)
+        # tf.stem is e.g. "103_1241_000000_000001.normalized", so remove that extra suffix
+        base_stem = tf.stem  # e.g. "103_1241_000000_000001.normalized"
+        if base_stem.endswith('.normalized') or base_stem.endswith('.original'):
+            base_stem = base_stem[:base_stem.rfind('.')]
+        wav_path = tf.parent / (base_stem + '.wav')
         if not wav_path.exists():
-            # Try .flac
-            wav_path = tf.with_suffix('.flac')
+            wav_path = tf.parent / (base_stem + '.flac')
         if not wav_path.exists():
             continue
         # Speaker ID from LibriTTS path structure: .../<speaker_id>/<chapter_id>/...
@@ -429,8 +432,10 @@ class PipelineEvaluator:
         streamvc_config_path: str = "configs/streamvc_config.yaml",
         target_speaker_audio: Optional[str] = None,
         device: str = "cuda",
-        output_dir: str = "outputs/eval"
+        output_dir: str = "outputs/eval",
+        skip_mt: bool = False
     ):
+        self.skip_mt = skip_mt
         self.device_str = device if torch.cuda.is_available() else "cpu"
         self.device = torch.device(self.device_str)
         self.output_dir = Path(output_dir)
@@ -458,17 +463,21 @@ class PipelineEvaluator:
         )
 
         # MT
-        print("[2/5] Loading MT...")
-        from mt.translator import MachineTranslator
-        mt_cfg = self.config['mt']
-        self.mt = MachineTranslator(
-            model_name=mt_cfg['model_name'],
-            src_lang=mt_cfg['src_lang'],
-            tgt_lang=mt_cfg['tgt_lang'],
-            device=self.device_str,
-            max_length=mt_cfg.get('max_length', 256),
-            num_beams=mt_cfg.get('num_beams', 5)
-        )
+        if self.skip_mt:
+            print("[2/5] Loading MT... SKIPPED (--skip-mt flag set)")
+            self.mt = None
+        else:
+            print("[2/5] Loading MT...")
+            from mt.translator import MachineTranslator
+            mt_cfg = self.config['mt']
+            self.mt = MachineTranslator(
+                model_name=mt_cfg['model_name'],
+                src_lang=mt_cfg['src_lang'],
+                tgt_lang=mt_cfg['tgt_lang'],
+                device=self.device_str,
+                max_length=mt_cfg.get('max_length', 256),
+                num_beams=mt_cfg.get('num_beams', 5)
+            )
 
         # TTS
         print("[3/5] Loading TTS...")
@@ -606,10 +615,16 @@ class PipelineEvaluator:
             result['asr_reference'] = ref
 
         # ── MT ───────────────────────────────────────────────────────────────
-        t0 = time.time()
-        translation = self.mt.translate_single(transcript)
-        result['mt_time_s'] = time.time() - t0
-        result['mt_output'] = translation
+        if self.mt is not None:
+            t0 = time.time()
+            translation = self.mt.translate_single(transcript)
+            result['mt_time_s'] = time.time() - t0
+            result['mt_output'] = translation
+        else:
+            # MT skipped — use ASR transcript directly for TTS (English)
+            translation = transcript
+            result['mt_skipped'] = True
+            result['mt_output'] = translation
 
         mt_dir = self.output_dir / "mt"
         mt_dir.mkdir(exist_ok=True)
@@ -948,6 +963,11 @@ Examples:
         "--seed", type=int, default=42,
         help="Random seed for test set generation"
     )
+    parser.add_argument(
+        "--skip-mt", action="store_true",
+        help="Skip Machine Translation (use ASR transcript directly for TTS). "
+             "Useful when NLLB model is unavailable or to save RAM."
+    )
 
     args = parser.parse_args()
 
@@ -972,7 +992,8 @@ Examples:
         streamvc_config_path=args.streamvc_config,
         target_speaker_audio=args.target_speaker,
         device=args.device,
-        output_dir=args.output_dir
+        output_dir=args.output_dir,
+        skip_mt=args.skip_mt
     )
 
     # ── Run evaluation ───────────────────────────────────────────────────────

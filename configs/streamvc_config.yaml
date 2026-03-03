@@ -18,7 +18,7 @@ model:
     
   decoder:
     in_channels: 64  # From content encoder
-    hidden_dim: 40  # C parameter from paper
+    hidden_dim: 128  # Increased from 40 for better reconstruction quality
     num_layers: 12
     kernel_size: 5
     output_channels: 1
@@ -42,27 +42,40 @@ audio:
   latent_rate: 50  # Hz (20ms frames)
 
 training:
-  batch_size: 16 # Reduced for longer 2-second segments
-  num_epochs: 100
-  learning_rate: 1.0e-4
+  batch_size: 8   # Reduced from 12 for VRAM headroom (HuBERT model + larger decoder)
+  num_epochs: 60
+  val_every_n_epochs: 1     # Run validation after every N training epochs
+  keep_last_n_checkpoints: 5  # How many epoch checkpoints to retain
+  early_stopping_patience: 15  # Stop if val_loss doesn't improve for N epochs
+  learning_rate: 2.0e-4      # Slightly higher LR for self-reconstruction (easier task)
   optimizer: "adamw"
   weight_decay: 1.0e-6
+  
+  # Discriminator stability settings
+  disc_lr_multiplier: 2.0       # D lr = base_lr * 2 = 4e-4
+  disc_warmup_steps: 3000       # Shorter warmup — self-recon converges faster
+  disc_grad_clip: 1.0           # Gradient clipping for discriminator
+  r1_penalty_weight: 10.0       # R1 gradient penalty weight
+  r1_interval: 16               # Lazy R1: apply penalty every 16 steps
+  disc_steps_per_g: 1           # D steps per G step
+  
   scheduler:
     type: "cosine"
-    warmup_steps: 1000
+    warmup_steps: 500           # Faster warmup for higher LR
     
   losses:
     reconstruction_weight: 1.0
     content_prediction_weight: 1.0
-    adversarial_weight: 1.0
-    feature_matching_weight: 10.0
-    stft_weight: 45.0
+    adversarial_weight: 4.0        # Reduced from 8.0 — recon loss is now meaningful
+    feature_matching_weight: 3.0   # Reduced from 5.0 — less needed for self-recon
+    stft_weight: 15.0              # Reduced from 20.0 — balance with meaningful recon
     
   discriminator:
     type: "multi_scale"
     scales: [1, 2, 4]
     hidden_dim: 64
     num_layers: 4
+    use_spectral_norm: true        # NEW: enable spectral normalization
     
   gradient:
     clip_norm: 1.0
@@ -71,7 +84,8 @@ training:
 data:
   train_datasets:
     - data/libritts/LibriTTS/train-clean-100
-  val_split: 0.05
+  val_ratio: 0.05           # 5% of files held out for validation
+  segment_duration_s: 2.0   # Audio segment length in seconds
   num_workers: 6
   pin_memory: true
   

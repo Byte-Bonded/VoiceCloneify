@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import torch
 import numpy as np
 import soundfile as sf
+import librosa
 from typing import Optional
 import yaml
 
@@ -146,7 +147,6 @@ class VoiceClonePipeline:
         
         # Step 1: ASR
         print("\n[Step 1/4] ASR: Transcribing audio...")
-        import librosa
         source_audio, sr = librosa.load(input_audio_path, sr=16000, mono=True)
         
         transcript = self.asr.transcribe_chunk(source_audio, language="en")
@@ -163,8 +163,14 @@ class VoiceClonePipeline:
         
         # Step 3: TTS
         print("\n[Step 3/4] TTS: Synthesizing speech...")
-        tts_audio = self.tts.synthesize(translation)
-        print(f"  Generated audio: {len(tts_audio)} samples ({len(tts_audio)/16000:.2f}s)")
+        # Chunk text to avoid SpeechT5's ~600-token limit
+        tts_config = self.config.get('tts', {}).get('synthesis', {})
+        chunk_size = tts_config.get('chunk_size', 50)  # words per chunk
+        words = translation.split()
+        chunks = [' '.join(words[i:i + chunk_size]) for i in range(0, len(words), chunk_size)]
+        tts_chunks = [self.tts.synthesize(chunk) for chunk in chunks]
+        tts_audio = np.concatenate(tts_chunks) if len(tts_chunks) > 1 else tts_chunks[0]
+        print(f"  Generated audio: {len(tts_audio)} samples ({len(tts_audio)/16000:.2f}s) from {len(chunks)} chunk(s)")
         
         # Save TTS output
         tts_output_path = output_path.replace('.wav', '_tts_speecht5.wav')
@@ -182,17 +188,14 @@ class VoiceClonePipeline:
             tts_audio_tensor = torch.from_numpy(tts_audio).unsqueeze(0).unsqueeze(0).to(self.device)
             target_audio_tensor = torch.from_numpy(target_audio).unsqueeze(0).to(self.device)
             
-            # Extract target mel
+            # Extract target mel (full reference — speaker encoder pools to 1 embedding)
             target_mel = self.mel_extractor(target_audio_tensor)
             
-            # Extract f0 features from TTS audio
+            # Extract f0 features from TTS audio (must stay full length to match content)
             f0_features = self.f0_extractor(tts_audio, return_numpy=False)
             f0_features = f0_features.transpose(0, 1).unsqueeze(0).to(self.device)
-            
-            # Ensure alignment
-            min_len = min(target_mel.size(2), f0_features.size(2))
-            target_mel = target_mel[:, :, :min_len]
-            f0_features = f0_features[:, :, :min_len]
+            # NOTE: do NOT align target_mel with f0_features — they are from different
+            # audio clips. StreamDecoder aligns content↔f0 internally.
             
             # Apply voice conversion
             with torch.no_grad():

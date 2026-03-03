@@ -1,0 +1,939 @@
+================================================================================
+         VOICECLONEIFY — COMPREHENSIVE DEBUG & ARCHITECTURAL REVIEW REPORT
+         Role: Senior AI Engineer | Production-Level Code & Architecture Review
+         Date: 2026-02-28
+================================================================================
+
+PROJECT OVERVIEW
+----------------
+Pipeline: ASR (Distil-Whisper) → MT (NLLB-200) → TTS (SpeechT5) → StreamVC (GAN)
+Goal: Real-time English→French voice translation with target-speaker voice cloning.
+Files Reviewed: 12 Python source files, 2 YAML configs, all supporting scripts.
+
+================================================================================
+SECTION 1 — CRITICAL ISSUES
+(Will cause crashes or complete training/inference failure)
+================================================================================
+
+[C-01] BROKEN QUERY EXPANSION IN ATTENTION POOLING
+File:    streamvc/model.py — LearnableAttentionPooling.forward()
+Lines:   ~130–150
+
+Problem:
+  self.query = nn.Parameter(torch.randn(1, output_dim))
+  ...
+  query = self.query.expand(B, -1, -1)  # Attempting to expand 2D → 3D
+
+  PyTorch's expand() can prepend new singleton dimensions, so the result is
+  shape (B, 1, output_dim). While technically it can work in some PyTorch
+  versions, this relies on undocumented behavior that "new dimensions are
+  appended at the front." The safe, explicit, and canonical form is to call
+  unsqueeze(0) first. The current form can silently produce wrong batch
+  shapes in PyTorch builds that don't support this extension.
+
+Fix:
+  # Change parameter init to include the batch-singleton dimension:
+  self.query = nn.Parameter(torch.randn(1, 1, output_dim))
+  ...
+  # In forward():
+  query = self.query.expand(B, -1, -1)  # Now (B, 1, output_dim) — unambiguous
+
+
+--------------------------------------------------------------------------------
+
+[C-02] CONTENT PROJECTION LAYER NOT SAVED OR LOADED IN CHECKPOINTS
+File:    streamvc/train.py — save_checkpoint() / load_checkpoint()
+Lines:   ~355–405
+
+Problem:
+  self.content_projection = nn.Linear(content_dim, hubert_dim).to(self.device)
+
+  This layer is added to optimizer_g and trained throughout the run.
+  However, save_checkpoint() only serializes:
+    {'model': ..., 'discriminator': ..., 'optimizer_g': ..., 'optimizer_d': ...}
+
+  content_projection is completely absent. When training is resumed, the
+  projection layer is re-initialized from scratch with random weights,
+  invalidating all previously learned centroids projection. HuBERT pseudo-labels
+  become meaningless after resume, silently corrupting content loss.
+
+Fix:
+  # In save_checkpoint():
+  torch.save({
+      ...
+      'content_projection': self.content_projection.state_dict(),
+      ...
+  }, checkpoint_path)
+
+  # In load_checkpoint():
+  self.content_projection.load_state_dict(checkpoint['content_projection'])
+
+
+--------------------------------------------------------------------------------
+
+[C-03] NON-CAUSAL DOWNSAMPLING IN CONTENT ENCODER BREAKS STREAMING GUARANTEE
+File:    streamvc/model.py — ContentEncoder.__init__()
+Line:    ~90
+
+Problem:
+  self.downsample = nn.Conv1d(
+      hidden_dim, hidden_dim,
+      kernel_size=self.hop_length * 2,   # 640
+      stride=self.hop_length,            # 320
+      padding=self.hop_length // 2       # 160 samples = 10ms look-ahead
+  )
+
+  The padding of 160 samples introduces a 10ms future look-ahead into the
+  CONTENT ENCODER. The entire architecture is designed to be causal/streaming
+  (60ms latency claim), but this single non-causal layer invalidates the
+  streaming constraint. All paper claims about latency are broken at inference.
+
+Fix:
+  Use asymmetric (causal) padding: pad only the left (past) side, none
+  on the right (future):
+
+  # Option A — Manual causal padding:
+  self.downsample = nn.Conv1d(
+      hidden_dim, hidden_dim,
+      kernel_size=self.hop_length * 2,
+      stride=self.hop_length,
+      padding=0  # No automatic padding
+  )
+  # In forward, before downsample:
+  # x = F.pad(x, (self.hop_length * 2 - 1, 0))  # Left-only padding
+
+  # Option B — Wrap with CausalConv1d logic applied to strided conv.
+
+
+--------------------------------------------------------------------------------
+
+[C-04] TRIPLE FORWARD PASS PER TRAINING STEP — MEMORY EXPLOSION
+File:    streamvc/train.py — train_step()
+Lines:   ~175–260
+
+Problem:
+  A single train_step() runs THREE full model forward passes:
+
+  Pass 1 (gradient):
+    output_audio, content_logits = self.model(source_audio, target_mel, f0_features)
+
+  Pass 2 (no_grad, to compute hubert targets):
+    _, content_features = self.model.content_encoder(source_audio)
+    hubert_targets = self.compute_hubert_targets(content_features)
+
+  Pass 3 (no_grad, for discriminator training):
+    output_audio_det, _ = self.model(source_audio, target_mel, f0_features)
+
+  Pass 1 already computes content_logits from content_encoder. Pass 2
+  re-runs content_encoder independently (wasteful). Pass 3 re-runs the
+  entire model (very wasteful). This triples memory bandwidth and
+  computation per step, explaining extremely slow VRAM usage.
+
+Fix:
+  # Detach output from Pass 1 for discriminator training:
+  output_audio_det = output_audio.detach()
+
+  # Cache content_features from Pass 1 by modifying model.forward()
+  # to return them, or expose content encoder call externally.
+  # Then compute hubert_targets from the already-available content_features.
+
+  # Eliminate all redundant forward passes.
+
+
+================================================================================
+SECTION 2 — MAJOR ISSUES
+(Cause incorrect training dynamics, wrong results, or silent failures)
+================================================================================
+
+[M-01] SAME-SPEAKER PAIRS ALLOWED IN DATASET — COLLAPSES VOICE CONVERSION TRAINING
+File:    streamvc/dataset.py — __getitem__()
+Lines:   ~100–115
+
+Problem:
+  target_idx = random.randint(0, len(self.audio_files) - 1)
+  # target_idx can equal idx — same file, same speaker
+
+  Voice conversion training requires source and target to be DIFFERENT
+  speakers so the model learns to disentangle speaker identity from content.
+  When source == target, the trivial optimal solution is identity mapping:
+  the model learns to copy audio rather than convert speakers. With 33,236
+  files, P(same file) = 1/33236 ≈ 0.003%, but with clustered datasets like
+  LibriTTS where many files share a speaker, same-SPEAKER pairs are far more
+  frequent. This silently degrades speaker disentanglement.
+
+Fix:
+  # Build a speaker-indexed lookup at init:
+  self.speaker_files = {}  # {speaker_id: [file_paths]}
+  for f in self.audio_files:
+      spk = f.parts[-3]  # LibriTTS: root/speaker_id/chapter/file
+      self.speaker_files.setdefault(spk, []).append(f)
+  self.speakers = list(self.speaker_files.keys())
+
+  # In __getitem__, pick a different speaker:
+  source_speaker = source_path.parts[-3]
+  target_speaker = random.choice(
+      [s for s in self.speakers if s != source_speaker]
+  )
+  target_path = random.choice(self.speaker_files[target_speaker])
+
+
+--------------------------------------------------------------------------------
+
+[M-02] GRADIENT CLIPPING EXCLUDES content_projection — TRAINING INSTABILITY
+File:    streamvc/train.py — train_step()
+Lines:   ~235–240
+
+Problem:
+  torch.nn.utils.clip_grad_norm_(
+      self.model.parameters(),      # ← Only model params!
+      self.config['training']['gradient']['clip_norm']
+  )
+
+  content_projection is trained by optimizer_g but NOT included in gradient
+  clipping. Its gradients can explode freely, causing loss spikes and
+  potentially NaN propagation via the hubert_targets computation.
+
+Fix:
+  all_gen_params = list(self.model.parameters()) + \
+                   list(self.content_projection.parameters())
+  torch.nn.utils.clip_grad_norm_(all_gen_params, clip_norm)
+
+
+--------------------------------------------------------------------------------
+
+[M-03] SEGMENT LENGTH HARDCODED IN TRAINER — IGNORES CONFIG VALUE
+File:    streamvc/train.py — __init__()
+Line:    ~112
+
+Problem:
+  self.train_dataset = VoiceConversionDataset(
+      ...
+      segment_length=int(self.config['audio']['sample_rate'] * 1.0),  # 16000 = 1s
+      ...
+  )
+
+  The config (streamvc_config.yaml) sets segment_length implicitly via
+  the model design for 2-second segments (32000 samples). The hardcoded
+  * 1.0 ignores data.segment_length from config. The comment in
+  dataset.py says "32000 — 2 seconds... increased for stable mel extraction"
+  yet training uses 1-second segments. This causes:
+  - Shorter context than intended.
+  - Potential shape mismatches if any component has minimum length requirements.
+
+Fix:
+  segment_length = self.config.get('data', {}).get(
+      'segment_length',
+      int(self.config['audio']['sample_rate'] * 2.0)  # Default 2s
+  )
+  self.train_dataset = VoiceConversionDataset(
+      ..., segment_length=segment_length, ...
+  )
+
+
+--------------------------------------------------------------------------------
+
+[M-04] DISCRIMINATOR LOSS MISMATCH — HINGE LOSS FOR REAL, MSE FOR FAKE
+File:    streamvc/discriminator.py — discriminator_loss() / generator_adversarial_loss()
+Lines:   ~167–210
+
+Problem:
+  The discriminator uses hinge loss:
+    loss_real = torch.mean(F.relu(1.0 - dr))
+    loss_fake = torch.mean(F.relu(1.0 + df))
+
+  But generator_adversarial_loss uses MSE (LSGAN):
+    loss += torch.mean((1.0 - df) ** 2)
+
+  These are two incompatible GAN formulations (Hinge-GAN vs. LSGAN).
+  Using Hinge discriminator with LSGAN generator is theoretically inconsistent
+  and produces suboptimal gradient signals. Either use Hinge throughout or
+  LSGAN throughout.
+
+Fix (Hinge throughout — consistent with paper):
+  def generator_adversarial_loss(disc_fake_outputs):
+      loss = 0.0
+      for df in disc_fake_outputs:
+          loss -= torch.mean(df)   # Hinge generator loss
+      return loss / len(disc_fake_outputs)
+
+
+--------------------------------------------------------------------------------
+
+[M-05] F0 FEATURES INCONSISTENCY — WHITENED F0 vs. RAW LOG-F0 IN SAME VECTOR
+File:    streamvc/f0_extractor.py — compute_uncertainty_features()
+Lines:   ~105–130
+
+Problem:
+  # Feature 0: whitened f0 (per-utterance z-score)
+  features[:, 0] = (f0 - f0_mean) / f0_std
+
+  # Feature 1: log f0 of the RAW (non-whitened) values
+  features[:, 1] = np.log(f0 + 1e-8)
+
+  Feature 0 is speaker-normalized (whitened). Feature 1 is unnormalized
+  raw log-F0 which retains absolute pitch level (encodes speaker identity).
+  This partially defeats whitening: the model can still infer speaker from
+  feature 1 even after whitening feature 0.
+
+Fix:
+  # Use whitened f0 for the log-f0 feature:
+  f0_whitened = features[:, 0]  # Already computed
+  features[:, 1] = np.log(np.abs(f0_whitened) + 1e-8)
+  # Or log of re-scaled f0 using mean only (preserve shape, not level):
+  features[:, 1] = np.log(f0 / (f0_mean + 1e-8) + 1e-8)
+
+
+--------------------------------------------------------------------------------
+
+[M-06] O(N²) PYTHON LOOP FOR F0 INTERPOLATION — RUNTIME BOTTLENECK
+File:    streamvc/f0_extractor.py — extract_f0()
+Lines:   ~57–82
+
+Problem:
+  for i in range(len(f0_values)):
+      if f0_values[i] == 0:
+          left_idx = voiced_indices[voiced_indices < i]   # O(N) numpy
+          right_idx = voiced_indices[voiced_indices > i]  # O(N) numpy
+          ...
+
+  For each unvoiced frame, this performs two O(N) numpy array indexing
+  operations inside a Python for-loop. The total complexity is O(N²) per
+  utterance. Since f0 extraction is called for every sample in every batch,
+  this is the primary CPU bottleneck during training.
+
+Fix:
+  # Use numpy searchsorted for O(N log N) total interpolation:
+  from scipy.interpolate import interp1d
+
+  voiced_f0 = f0_values.copy()
+  voiced_mask = voiced_f0 > 0
+  if voiced_mask.sum() >= 2:
+      x = np.where(voiced_mask)[0]
+      y = voiced_f0[voiced_mask]
+      interp = interp1d(x, y, kind='linear', bounds_error=False,
+                        fill_value=(y[0], y[-1]))
+      f0_interp = interp(np.arange(len(f0_values)))
+  else:
+      f0_interp = np.full_like(f0_values, 150.0)
+
+
+--------------------------------------------------------------------------------
+
+[M-07] DISCRIMINATOR GROUPNORM BREAKS WITH SMALL CHANNEL COUNTS
+File:    streamvc/discriminator.py — DiscriminatorBlock.__init__()
+Line:    ~33
+
+Problem:
+  self.norm = nn.GroupNorm(min(32, out_channels // 4), out_channels)
+
+  ScaleDiscriminator builds channels = [1, 64, 128, 256, 512] for 4 layers.
+  The first channel `in_channels=1` never goes through GroupNorm, so that's
+  fine. But if the architecture is modified to smaller hidden_dim (e.g.,
+  hidden_dim=16), out_channels=16 → groups=min(32,4)=4 which might cause
+  issues if out_channels is not divisible by the chosen groups for odd
+  configurations.
+
+  More critically: channels[0] = 1, channels[1] = hidden_dim. The FIRST
+  DiscriminatorBlock takes in_channels=1 and out_channels=hidden_dim=64.
+  GroupNorm(min(32,16), 64) → GroupNorm(16, 64) — valid.
+  But if output channels ever become odd (non-multiple of groups), this
+  silently produces wrong normalization or crashes.
+
+Fix:
+  # Use a more robust group selection:
+  def safe_groupnorm(num_channels):
+      for g in [32, 16, 8, 4, 2, 1]:
+          if num_channels % g == 0:
+              return nn.GroupNorm(g, num_channels)
+  self.norm = safe_groupnorm(out_channels)
+
+
+--------------------------------------------------------------------------------
+
+[M-08] TTS synthesize_batch IS NOT BATCHED — MISLEADING API
+File:    tts/text_to_speech.py — synthesize_batch()
+Lines:   ~120–145
+
+Problem:
+  def synthesize_batch(self, texts: list[str], ...):
+      for text in texts:
+          audio = self.synthesize(text, ...)  # Sequential, not batched!
+          audios.append(audio)
+
+  The method iterates sequentially with no GPU batching at all. The name
+  implies batch synthesis (GPU-parallel), but it's a plain Python loop.
+  If called with N texts, there are N separate model.generate_speech() calls,
+  N vocoder passes, and N CPU↔GPU transfers. For the full pipeline, this
+  is the TTS throughput bottleneck.
+
+Fix:
+  # SpeechT5 generate_speech supports batch inputs:
+  def synthesize_batch(self, texts, speaker=None, speaker_embedding=None):
+      inputs = self.processor(
+          text=texts, return_tensors="pt", padding=True
+      ).to(self.device)
+      spectrograms = self.model.generate_speech(
+          inputs["input_ids"],
+          speaker_embedding.expand(len(texts), -1)
+      )
+      # Note: SpeechT5 generate_speech returns one spectrogram per input;
+      # batch vocoding may require additional handling per HuggingFace docs.
+
+
+================================================================================
+SECTION 3 — MINOR ISSUES
+(Won't crash, but cause subtle bugs, inefficiencies, or incorrect behavior)
+================================================================================
+
+[m-01] REDUNDANT NESTED torch.no_grad() IN TTS SYNTHESIZE
+File:    tts/text_to_speech.py — synthesize()
+Lines:   ~95–115
+
+Problem:
+  @torch.no_grad()
+  def synthesize(self, text, ...):
+      ...
+      with torch.no_grad():    # ← Redundant; already under @torch.no_grad()
+          audio = self.vocoder(spectrogram)
+
+Fix:
+  Remove the inner `with torch.no_grad():` block — the decorator already
+  disables gradient computation for the full method body.
+
+
+--------------------------------------------------------------------------------
+
+[m-02] ASR BUFFER MANAGEMENT CAUSES TEXT DUPLICATION IN STREAMING MODE
+File:    asr/streaming_asr.py — add_audio()
+Lines:   ~120–155
+
+Problem:
+  transcript = self.transcribe_chunk(self.audio_buffer)
+
+  if any(transcript.endswith(char) for char in ['.', '!', '?']):
+      self.text_buffer += " " + transcript   # Appends transcript
+      result = self.text_buffer.strip()      # Returns all accumulated text
+      self.text_buffer = ""
+      self.audio_buffer = np.array([], ...)
+      return result
+  else:
+      self.text_buffer += " " + transcript   # Also appends to buffer
+      self.audio_buffer = np.array([], ...)  # Resets audio
+
+  When a sentence boundary is detected, `transcript` is the FULL re-
+  transcription of the current audio_buffer (which may span multiple chunks
+  because the buffer isn't reset on non-boundary). Meanwhile, text_buffer
+  accumulated fragments of previous transcriptions of the growing buffer.
+  The same audio content ends up transcribed and added multiple times before
+  the boundary is hit.
+
+Fix:
+  Only accumulate partial transcripts in text_buffer, OR always reset the
+  audio_buffer after a boundary and not accumulate intermediate text:
+
+  # Simpler, correct approach:
+  self.audio_buffer = np.concatenate([self.audio_buffer, audio_chunk])
+  chunk_size = int(self.sample_rate * self.chunk_duration)
+  if len(self.audio_buffer) >= chunk_size:
+      transcript = self.transcribe_chunk(self.audio_buffer)
+      self.audio_buffer = np.array([], dtype=np.float32)
+      return transcript
+  return None
+
+
+--------------------------------------------------------------------------------
+
+[m-03] sys.path MANIPULATION ADDS WRONG DIRECTORY
+File:    run_pipeline.py
+Lines:   9–10
+
+Problem:
+  sys.path.append(str(Path(__file__).parent.parent))
+
+  This adds the PARENT of VoiceCloneify (e.g., /home/pranaav/Work/projects/SEM6)
+  to sys.path. The intent is presumably to allow `from asr.streaming_asr import`
+  etc., which requires VoiceCloneify itself to be on the path. Since the script
+  is already in VoiceCloneify, the current directory handles this — and the
+  parent dir addition is an over-broad (and potentially conflicting) path add.
+
+Fix:
+  # Add VoiceCloneify itself (script's own directory):
+  sys.path.insert(0, str(Path(__file__).parent))
+  # Or better: use the installed package (pip install -e .)
+
+
+--------------------------------------------------------------------------------
+
+[m-04] train.py USES BARE MODULE IMPORTS — BREAKS IF RUN AS PACKAGE
+File:    streamvc/train.py
+Lines:   17–25
+
+Problem:
+  from model import StreamVC
+  from discriminator import MultiScaleDiscriminator, ...
+  from dataset import VoiceConversionDataset, collate_fn
+  from audio_utils import MelSpectrogramExtractor, STFTLoss
+  from f0_extractor import F0ExtractorModule
+
+  These bare imports work when running `python streamvc/train.py` directly
+  (Python adds streamvc/ to sys.path). However, running as `python -m
+  streamvc.train` or importing from a test harness will fail with
+  ModuleNotFoundError. The project also exposes these via the package
+  __init__.py, so the imports conflict with proper package structure.
+
+Fix:
+  from .model import StreamVC                         # relative import
+  from .discriminator import MultiScaleDiscriminator, ...
+  from .dataset import VoiceConversionDataset, collate_fn
+  from .audio_utils import MelSpectrogramExtractor, STFTLoss
+  from .f0_extractor import F0ExtractorModule
+
+
+--------------------------------------------------------------------------------
+
+[m-05] SPEAKER ENCODER RESIDUAL BLOCKS MISSING RESIDUAL CONNECTION ACTIVATION
+File:    streamvc/model.py — SpeakerEncoder.forward()
+Lines:   ~190–205
+
+Problem:
+  for block in self.blocks:
+      residual = x
+      x = block(x)        # block ends with GroupNorm (no activation)
+      x = F.gelu(x + residual)
+
+  Each `block` is an nn.Sequential ending with GroupNorm (no activation).
+  Adding the residual and then GELU is unconventional. The standard Pre-LN
+  or Post-LN residual applies norm before or after the residual addition—
+  not after a GroupNorm-ending block. This produces unnecessary double-norm
+  behavior (GroupNorm inside block + implicit via subsequent block's norm).
+
+Fix (align with ContentEncoder's ResidualBlock):
+  Replace the inline nn.Sequential with a proper ResidualBlock that uses
+  causal conv and has GELU between each layer, matching the encoder style.
+
+
+--------------------------------------------------------------------------------
+
+[m-06] TTS DEFAULT SPEAKER KEY 'awb' MAY NOT EXIST IN DATASET
+File:    tts/text_to_speech.py — __init__() and pipeline_config.yaml
+
+Problem:
+  default_speaker: "awb"
+
+  The dataset 'Matthijs/cmu-arctic-xvectors' indexes speakers by name.
+  'awb' is a valid CMU Arctic speaker (Scotsman), but its existence depends
+  on the dataset version. If the key doesn't exist, synthesize() silently
+  falls back to self.default_speaker which was just set to the missing key,
+  creating an infinite key-not-found print loop.
+
+Fix:
+  # In __init__, verify default speaker exists after loading:
+  if self.default_speaker not in self.speaker_embeddings:
+      self.default_speaker = next(iter(self.speaker_embeddings))
+      print(f"Default speaker not found; using {self.default_speaker}")
+
+
+--------------------------------------------------------------------------------
+
+[m-07] STFT LOSS WINDOW NOT REGISTERED AS BUFFER
+File:    streamvc/audio_utils.py — STFTLoss.stft()
+Lines:   ~140–150
+
+Problem:
+  window = torch.hann_window(win_length).to(x.device)
+
+  A new hann window tensor is allocated and moved to the device on EVERY
+  STFT call. With 3 STFT scales per training step and thousands of steps,
+  this is thousands of unnecessary small tensor allocations. Windows should
+  be pre-allocated and registered as buffers so they automatically move
+  with the module's device.
+
+Fix:
+  # In __init__, register buffers:
+  for i, win_length in enumerate(self.win_lengths):
+      self.register_buffer(f'window_{i}', torch.hann_window(win_length))
+
+  # In stft(), retrieve the pre-allocated window:
+  # (pass window index or use a dict)
+
+
+--------------------------------------------------------------------------------
+
+[m-08] POTENTIAL SHAPE MISMATCH IN PIPELINE f0_features FOR SHORT TTS AUDIO
+File:    run_pipeline.py — process_audio()
+Lines:   ~195–210
+
+Problem:
+  f0_features = self.f0_extractor(tts_audio, return_numpy=False)
+  f0_features = f0_features.transpose(0, 1).unsqueeze(0).to(self.device)
+
+  tts_audio from SpeechT5 has variable length. YinF0Extractor uses
+  parselmouth (Praat) internally which has a minimum pitch analysis window
+  (~3× floor period ≈ 3/50Hz ≈ 60ms at f0_min=50Hz). For very short TTS
+  outputs (< 100ms), parselmouth may return an empty or single-frame f0
+  array. Calling .transpose(0,1) on a (1, 9) tensor gives (9, 1) and
+  .unsqueeze(0) gives (1, 9, 1). The min-length clip later fixes alignment,
+  but content_features from StreamVC may have 0 time steps after clipping,
+  causing a zero-length batch dimension in the decoder.
+
+Fix:
+  # Add a minimum length guard before voice conversion:
+  if len(tts_audio) < self.sample_rate * 0.1:  # < 100ms
+      print("Warning: TTS output too short for voice conversion")
+      output_audio = tts_audio   # Use TTS output directly
+  else:
+      # Proceed with StreamVC
+
+
+================================================================================
+SECTION 4 — CONCEPTUAL FLAWS
+(Architectural decisions that conflict with stated goals or paper design)
+================================================================================
+
+[CF-01] CONTENT ENCODER PREDICTS HuBERT CENTROIDS FROM OWN FEATURES — CIRCULAR SUPERVISION
+File:    streamvc/train.py — compute_hubert_targets() + train_step()
+Status:  Conceptual mismatch with StreamVC paper
+
+Problem:
+  The StreamVC paper supervises the content encoder using ACTUAL HuBERT
+  discrete units extracted from a pre-trained HuBERT model (offline).
+  The k-means centroids (100 clusters) are learned from real HuBERT features.
+
+  The implementation uses a learned LINEAR PROJECTION (content_projection)
+  to map content encoder features (dim=64) to HuBERT space (dim=768), then
+  assigns pseudo-labels by nearest centroid in THAT projected space.
+
+  This is circular: the content encoder is trained to predict labels derived
+  from its own projected outputs. The projection has no ground truth — it is
+  trained simultaneously with the encoder. The centroids from HuBERT are used
+  as targets, but the distance is computed in a learned (not fixed HuBERT)
+  space. This collapses to trivially assigning all frames to the same cluster
+  (the one nearest the mean of random projections).
+
+Correct Design:
+  Run a pre-trained HuBERT model on source audio OFFLINE (or at batch time)
+  to extract actual speech unit frame labels. Store them or compute on-the-fly
+  using the frozen HuBERT model. Remove content_projection entirely.
+
+  In dataset.py or train_step():
+    with torch.no_grad():
+        hubert_outputs = frozen_hubert_model(source_audio)  # Real HuBERT
+        hubert_features = hubert_outputs.last_hidden_state  # (B, T, 768)
+        # Assign to centroids:
+        distances = torch.cdist(hubert_features, self.hubert_centroids)
+        hubert_targets = torch.argmin(distances, dim=-1)  # (B, T)
+  Then supervise content_encoder's output_proj (num_classes=100) with
+  cross-entropy against these frozen labels.
+
+
+--------------------------------------------------------------------------------
+
+[CF-02] STOP GRADIENT APPLIED INCORRECTLY — DISABLES CONTENT SUPERVISION
+File:    streamvc/model.py — StreamVC.forward()
+Lines:   ~395–405
+
+Problem:
+  content_logits, content_features = self.content_encoder(source_audio)
+  content_features_stopped = content_features.detach()   # Stop gradient
+  # ...
+  output_audio = self.decoder(content_features_stopped, ...)
+  return output_audio, content_logits
+
+  The stop gradient (detach) on content_features is intended to prevent
+  the decoder from affecting the content encoder's representation learning.
+  This is CORRECT per the paper.
+
+  HOWEVER: content_logits is returned and used in train_step() for
+  cross-entropy loss. The gradient DOES flow back to content_encoder
+  through content_logits — this part is also correct.
+
+  The issue: content_features.detach() means the decoder gradients
+  can't reach content_encoder. But content_logits = output_proj(features),
+  meaning output_proj IS trained. The features themselves ARE trained
+  (via content_logits path). So the architecture intent is preserved.
+
+  The REAL concept flaw: the decoder trains only on the DETACHED features,
+  meaning if content features change significantly during training, the
+  decoder sees a distribution shift it cannot backprop to fix. This creates
+  a training instability known as "representation mismatch during adaptation."
+
+Mitigation:
+  Use an exponential moving average (EMA) of content features, or use the
+  stop-gradient only after a warmup period where the content encoder is
+  more stable. Alternatively, use a small teacher-student gap update rather
+  than hard stop-gradient.
+
+
+--------------------------------------------------------------------------------
+
+[CF-03] VOICE CONVERSION REQUIRES SPEAKER-PAIR SUPERVISION — DATASET LACKS IT
+File:    streamvc/dataset.py
+Status:  Training objective cannot be verified
+
+Problem:
+  The model is trained to reconstruct target_audio given source content.
+  But because target is randomly selected (possibly same file), the model
+  never receives a ground-truth supervising pair: there is no known-correct
+  "converted" output for supervision.
+
+  This is a self-supervised / reconstruction objective, which is valid IF:
+  (a) source and target are different speakers (ensures voice conversion is needed)
+  (b) The model receives the source content + target speaker, and the loss is
+      measured against target (forcing matching target voice).
+
+  Condition (a) is violated (same-speaker pairs allowed — see M-01).
+  The training effectively becomes autoencoder reconstruction for same-speaker
+  pairs and voice-cloning for different-speaker pairs, with no way to
+  distinguish which objective is being optimized at each step.
+
+Correct Design:
+  Enforce different speaker pairs (see M-01 fix). Additionally, provide the
+  model with speaker identity labels during training so losses can be weighted
+  based on whether the pair is genuinely cross-speaker.
+
+
+--------------------------------------------------------------------------------
+
+[CF-04] F0 EXTRACTED FROM SOURCE THEN FED TO DECODER AS-IS — NO SPEAKER NORMALIZATION
+File:    streamvc/train.py — train_step()
+Lines:   ~170–185
+
+Problem:
+  f0_features = self.f0_extractor(source_audio)  # Source speaker's f0!
+  # ...
+  output_audio = self.decoder(content_features, speaker_embedding, f0_features)
+
+  The decoder uses the f0 extracted from the SOURCE speaker's audio. For
+  voice conversion, the output should have the TARGET speaker's f0 contour
+  (or at least a pitch-shifted version). Feeding raw source f0 into the
+  target-conditioned decoder means the converted voice will retain the
+  source speaker's exact pitch contour, defeating pitch-cloning.
+
+  The whitening (per-utterance z-score) in f0_extractor partially addresses
+  this by normalizing absolute pitch level, but relative contour shape
+  (which still encodes speaker characteristics like pitch range) is preserved.
+
+  Per the paper, f0 should be:
+  1. Extracted from source (captures content prosody).
+  2. Whitened to remove speaker-specific mean/variance.
+  3. The target speaker's F0 statistics should be used to re-scale at inference.
+
+  At TRAINING time, f0 whitening gives utterance-level normalization, but
+  there is no "re-scaling to target speaker" step implemented anywhere.
+
+Fix:
+  At inference: extract target speaker f0 statistics from reference audio,
+  then re-scale whitened source f0 to match target speaker's pitch range:
+    f0_denormalized = f0_whitened * target_f0_std + target_f0_mean
+
+
+================================================================================
+SECTION 5 — PERFORMANCE RISKS
+================================================================================
+
+[P-01] CPU BOTTLENECK: F0 EXTRACTION IS SYNCHRONOUS ON CPU DURING TRAINING
+File:    streamvc/f0_extractor.py, streamvc/train.py
+
+Problem:
+  F0ExtractorModule.forward() calls cpu().numpy(), runs parselmouth (Praat
+  via ctypes), then moves result back to GPU. This CPU-bound operation
+  runs synchronously IN the training loop, blocking GPU computation.
+  For batch_size=16 with 2-second segments: 16 × parselmouth calls × O(N²)
+  interpolation ≈ significant CPU stall per step.
+
+Fix:
+  Option A (recommended): Pre-extract and cache f0 features to disk during
+    dataset preprocessing (as numpy arrays). Load cached f0 in __getitem__.
+    This moves the CPU cost entirely out of the training loop.
+
+  Option B: Use Python multiprocessing (DataLoader num_workers > 0) to
+    parallelize f0 extraction across CPU cores while GPU trains.
+
+  Option C: Replace parselmouth with a differentiable F0 estimator
+    (e.g., CREPE, PENN) that runs on GPU.
+
+
+--------------------------------------------------------------------------------
+
+[P-02] MEMORY LEAK RISK: RESAMPLER CREATED ON EVERY load_audio() CALL
+File:    streamvc/audio_utils.py — load_audio()
+Lines:   ~65–80
+
+Problem:
+  if sr != sample_rate:
+      resampler = T.Resample(sr, sample_rate)
+      audio = resampler(audio)
+
+  A new T.Resample transform is instantiated on every load_audio() call
+  when resampling is needed. For LibriTTS (all 16kHz) this is no-op, but
+  if mixed-rate datasets are used, this creates thousands of small objects
+  per epoch, pressuring the garbage collector.
+
+Fix:
+  Cache resampler by input sr using functools.lru_cache:
+    from functools import lru_cache
+    @lru_cache(maxsize=32)
+    def _get_resampler(self, orig_sr, target_sr):
+        return T.Resample(orig_sr, target_sr)
+
+
+--------------------------------------------------------------------------------
+
+[P-03] CHECKPOINT CLEANUP DOES NOT HANDLE EPOCH CHECKPOINTS
+File:    streamvc/train.py — save_checkpoint()
+Lines:   ~365–375
+
+Problem:
+  checkpoints = sorted(self.checkpoint_dir.glob("checkpoint_step_*.pt"))
+  if len(checkpoints) > self.config['checkpointing']['keep_last_n']:
+      for old_ckpt in checkpoints[:-keep_last_n]:
+          old_ckpt.unlink()
+
+  The cleanup only considers checkpoint_step_*.pt files. The training loop
+  ALSO saves checkpoint_epoch_N.pt files per epoch:
+    self.save_checkpoint(name=f"checkpoint_epoch_{epoch}.pt")
+
+  Epoch checkpoints are NEVER cleaned up, accumulating indefinitely.
+  With 100 epochs, 100 files × ~model_size are retained, quickly
+  filling disk (each .pt file is likely 20–80MB depending on model size).
+
+Fix:
+  Add a parallel cleanup for epoch checkpoints:
+  epoch_ckpts = sorted(self.checkpoint_dir.glob("checkpoint_epoch_*.pt"),
+                       key=lambda p: int(p.stem.split('_')[-1]))
+  for old in epoch_ckpts[:-keep_last_n]:
+      old.unlink()
+
+
+--------------------------------------------------------------------------------
+
+[P-04] ALL 4 PIPELINE MODELS LOADED ONTO SAME DEVICE — VRAM EXHAUSTION
+File:    run_pipeline.py — VoiceClonePipeline.__init__()
+
+Problem:
+  ASR (Distil-Whisper ~100M params), MT (NLLB-200 600M params), TTS (SpeechT5
+  ~90M params + HiFiGAN), StreamVC (custom GAN). All are loaded to self.device
+  which defaults to "cuda". In fp16/float16, these collectively require:
+    ~50MB + ~1.2GB + ~180MB + ~100MB ≈ 1.6GB minimum
+  Plus activations for a single inference batch. On a 4GB GPU, this is
+  borderline. On a 6GB GPU, it leaves little room for safe operation.
+  The pipeline never explicitly manages inter-model memory.
+
+Fix:
+  Offload models not currently in use to CPU between pipeline stages:
+    self.asr_model.to('cpu'); torch.cuda.empty_cache()
+    self.mt_model.to('cuda')
+    # ... translate ...
+    self.mt_model.to('cpu'); torch.cuda.empty_cache()
+    self.tts_model.to('cuda')
+  Or use accelerate's device_map="auto" for automatic offloading.
+
+
+================================================================================
+SECTION 6 — REFACTORING RECOMMENDATIONS
+================================================================================
+
+[R-01] SPLIT train.py — TRAINER CLASS IS DOING TOO MUCH
+  StreamVCTrainer combines: model construction, data loading, loss
+  computation, checkpoint management, logging, and training loops.
+  Recommend splitting into:
+    - ModelFactory: builds model/discriminator from config
+    - LossComputer: all loss functions
+    - CheckpointManager: save/load/cleanup
+    - StreamVCTrainer: only training loop orchestration
+
+
+[R-02] UNIFIED AUDIO LOADING UTILITY
+  audio loading is duplicated across 4 files using different backends:
+    - dataset.py: librosa.load()
+    - audio_utils.py: torchaudio.load()
+    - run_pipeline.py: librosa.load()
+    - test_streamvc.py: librosa.load()
+  Standardize on one backend (torchaudio recommended for training
+  as it supports GPU-accelerated transforms and avoids CPU bottleneck).
+
+
+[R-03] CONFIG VALIDATION AT STARTUP
+  The trainer accesses deeply nested config keys without validation:
+    self.config['training']['discriminator']['scales']
+    self.config['training']['gradient']['clip_norm']
+    self.config['data']['num_workers']
+  A missing or mistyped key raises a raw KeyError with no diagnostic context.
+  Recommend using pydantic or dacite for config schema validation at startup.
+
+
+[R-04] REMOVE sys.argv PROCESSING FROM __main__ BLOCKS
+  Multiple files (tts, asr, mt) have argparse __main__ blocks for standalone
+  testing. These are good, but they should import from a properly installed
+  package rather than requiring execution from specific directories. The
+  test scripts (test_tts.py, test_streamvc.py) partially duplicate this
+  functionality. Consolidate into a unified test/eval harness.
+
+
+[R-05] MAGIC NUMBERS SHOULD BE CONFIG-DRIVEN
+  Multiple files hardcode values that should be in config:
+    - f0_extractor.py: 150.0 (default f0 for unvoiced) — what basis?
+    - dataset.py: noise amplitude 0.005, scale range (0.8, 1.2), prob 0.5/0.3
+    - audio_utils.py: 1e-8 (mel log floor), 1e-5 (STFT log floor)
+    - model.py: dilation=2**i for content encoder, 2**(i%4) for decoder
+  Move these to configs or named constants with explanatory comments.
+
+
+[R-06] TYPE HINTS USE PYTHON 3.10+ SYNTAX IN CODE TARGETING 3.9+
+  # Examples found:
+  tts/text_to_speech.py: list[str]  (builtin generic — Python 3.9+ ✓)
+  # But mixed with:
+  from typing import List  (typing module — Python 3.5+)
+  Standardize to either `from typing import List` everywhere for 3.9 compat,
+  or use `list[str]` everywhere if 3.9+ is guaranteed. Currently inconsistent.
+
+
+================================================================================
+SECTION 7 — SUMMARY SCORECARD
+================================================================================
+
+  Category                    Count   Risk Level
+  ─────────────────────────── ─────── ──────────────────────────────────────
+  Critical Issues             4       System crash / silent training failure
+  Major Issues                8       Wrong results / training instability
+  Minor Issues                8       Subtle bugs / API confusion
+  Conceptual Flaws            4       Wrong theory → wrong model learned
+  Performance Risks           4       VRAM exhaustion / CPU bottleneck
+  Refactoring Recommendations 6       Maintainability / correctness
+  ─────────────────────────── ─────── ──────────────────────────────────────
+  TOTAL                       34
+
+
+================================================================================
+PRIORITIZED ACTION PLAN
+================================================================================
+
+  Priority 1 (Fix Before Next Training Run):
+    C-02  Save/load content_projection in checkpoints
+    C-03  Fix non-causal content encoder downsampling
+    C-04  Reduce to 1-2 forward passes per step
+    M-01  Enforce different-speaker pairs in dataset
+    CF-01 Replace circular HuBERT supervision with frozen HuBERT (CRITICAL)
+
+  Priority 2 (Fix for Production-Quality Training):
+    M-02  Clip gradients for content_projection
+    M-03  Use config segment_length instead of hardcoded 1.0s
+    M-04  Unify GAN loss formulation (Hinge or LSGAN — not both)
+    M-05  Fix whitening consistency in f0 features
+    CF-04 Add f0 denormalization at inference
+
+  Priority 3 (Performance & Robustness):
+    P-01  Pre-cache f0 features or move to DataLoader workers
+    P-03  Clean up epoch checkpoints
+    P-04  Manage multi-model GPU memory
+    M-06  Fix O(N²) f0 interpolation
+    M-07  Pre-allocate STFT windows as module buffers
+
+  Priority 4 (Code Quality & Architecture):
+    m-04  Fix relative imports in train.py
+    m-03  Fix sys.path manipulation
+    R-01–R-06 All refactoring recommendations
+
+================================================================================
+END OF REPORT
+================================================================================
