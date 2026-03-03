@@ -1,0 +1,78 @@
+# Pipeline Configuration
+
+pipeline:
+  name: "ASR → MT → TTS → StreamVC"
+  language_pair:
+    source: "eng_Latn"  # English
+    target: "fra_Latn"  # French
+  
+  latency_target: 150  # milliseconds
+  frame_size: 20  # milliseconds
+  sample_rate: 16000
+
+asr:
+  model_name: "distil-whisper/distil-small.en"
+  device: "cuda"  # or "cpu"
+  compute_type: "float16"  # or "int8" for faster CPU
+  beam_size: 5
+  
+  streaming:
+    chunk_duration: 1.0  # seconds
+    min_silence_duration: 0.5
+    sentence_boundary_chars: [".", "!", "?"]
+
+mt:
+  model_name: "facebook/nllb-200-distilled-600M"
+  device: "cuda"
+  max_length: 256
+  num_beams: 5
+  early_stopping: true
+  
+  # English → French
+  src_lang: "eng_Latn"
+  tgt_lang: "fra_Latn"
+
+tts:
+  model_name: "microsoft/speecht5_tts"
+  vocoder_name: "microsoft/speecht5_hifigan"
+  device: "cuda"
+  
+  # Neutral speaker (can be replaced with custom)
+  speaker_embeddings: "Matthijs/cmu-arctic-xvectors"
+  default_speaker: "awb"  # Neutral male voice
+  
+  synthesis:
+    max_length: 1024
+    chunk_size: 50  # tokens
+
+streamvc:
+  checkpoint_path: "./checkpoints/streamvc/best.pt"
+  config_path: "./configs/streamvc_config.yaml"
+  device: "cuda"
+  
+  speaker_encoder:
+    model_name: "speechbrain/spkrec-ecapa-voxceleb"
+    
+  streaming:
+    frame_size: 20  # ms
+    lookahead_frames: 2  # 60ms
+    buffer_size: 10  # frames
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+  websocket_port: 8001
+  max_connections: 10
+  
+ui:
+  interface: "gradio"
+  share: false
+  server_port: 7860
+  
+  mic_settings:
+    sample_rate: 16000
+    chunk_duration: 20  # ms
+    
+  speaker_library:
+    path: "./data/speaker_references"
+    max_speakers: 100

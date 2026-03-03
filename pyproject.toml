@@ -1,0 +1,92 @@
+[project]
+name = "voicecloneify"
+version = "0.1.0"
+description = "Real-time voice cloning with translation: ASR → MT → TTS → StreamVC pipeline"
+authors = [
+    {name = "VoiceCloneify Team"}
+]
+readme = "README.md"
+requires-python = ">=3.9,<3.12"
+dependencies = [
+    # Core ML frameworks
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+    "torchvision>=0.15.0",
+    
+    # Transformers and pretrained models
+    "transformers>=4.35.0",
+    "accelerate>=0.24.0",
+    "sentencepiece>=0.1.99",
+    "protobuf>=3.20.0",
+    
+    # Audio processing
+    "librosa>=0.10.0",
+    "soundfile>=0.12.0",
+    "audioread>=3.0.0",
+    "resampy>=0.4.2",
+    "pyworld>=0.3.4",  # For Yin f0 extraction
+    "praat-parselmouth>=0.4.3",  # Alternative f0 extraction
+    
+    # Speaker embeddings and VC
+    "speechbrain>=0.5.15",
+    "resemblyzer>=0.1.1",
+    
+    # Fast inference
+    "faster-whisper>=0.10.0",
+    "onnxruntime>=1.16.0",
+    "optimum>=1.14.0",
+    
+    # Server and streaming
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "websockets>=12.0",
+    "python-multipart>=0.0.6",
+    
+    # UI and visualization
+    "gradio>=4.7.0",
+    "matplotlib>=3.7.0",
+    "numpy>=1.24.0,<2.0.0",
+    "scipy>=1.11.0",
+    
+    # Data processing
+    "datasets>=2.14.0",
+    "pandas>=2.0.0",
+    "tqdm>=4.66.0",
+    "pyyaml>=6.0",
+    "omegaconf>=2.3.0",
+    
+    # Evaluation
+    "jiwer>=3.0.0",  # WER/CER
+    "sacrebleu>=2.3.0",  # BLEU
+    "pesq>=0.0.4",  # Speech quality
+    
+    # Utilities
+    "requests>=2.31.0",
+    "tensorboard>=2.14.0",
+    "wandb>=0.16.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "black>=23.9.0",
+    "isort>=5.12.0",
+    "flake8>=6.1.0",
+    "mypy>=1.5.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.black]
+line-length = 100
+target-version = ['py39', 'py310', 'py311']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"

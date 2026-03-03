@@ -1,0 +1,89 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Data and models
+data/*
+!data/.gitkeep
+!data/*.py
+checkpoints/
+!checkpoints/.gitkeep
+outputs/
+!outputs/.gitkeep
+logs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.tflite
+
+# Dataset downloads
+*.tar.gz
+*.zip
+*.tar
+*.gz
+
+# Audio files (keep some examples)
+*.wav
+*.mp3
+*.flac
+!examples/*.wav
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary
+tmp/
+temp/
+*.tmp
+
+# Config overrides
+local_config.yaml
+.env
+*.env
+
+# Logs
+*.log
+
+# Audio samples (optional - comment out if you want to track them)
+*.wav
+*.mp3
+*.flac
+!examples/*.wav

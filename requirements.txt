@@ -1,0 +1,57 @@
+# ── Install torch FIRST (needs --index-url, see commands below) ──
+# pip install torch==2.6.0+cu124 torchaudio==2.6.0+cu124 torchvision==0.21.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+
+# Core ML frameworks (install AFTER torch)
+transformers>=4.35.0
+accelerate>=0.24.0
+sentencepiece>=0.1.99
+datasets>=2.14.0
+
+# Audio processing
+librosa>=0.10.0
+soundfile>=0.12.0
+audioread>=3.0.0
+resampy>=0.4.2
+pyworld>=0.3.4
+praat-parselmouth>=0.4.3
+
+# Speaker embeddings
+speechbrain>=0.5.15
+resemblyzer>=0.1.1
+
+# Fast inference
+faster-whisper>=0.10.0
+onnxruntime>=1.16.0
+optimum>=1.14.0
+
+# Server and UI
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+websockets>=12.0
+gradio>=4.7.0
+
+# Data processing
+numpy>=1.24.0
+scipy>=1.11.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+tqdm>=4.66.0
+
+# Config
+pyyaml>=6.0
+omegaconf>=2.3.0
+
+# Visualization
+matplotlib>=3.7.0
+tensorboard>=2.14.0
+
+# Evaluation metrics
+jiwer>=3.0.0
+sacrebleu>=2.3.0
+pesq>=0.0.4
+pystoi>=0.4.0
+
+# Utilities
+requests>=2.31.0
+protobuf>=3.20.0
+webrtcvad>=2.0.10
